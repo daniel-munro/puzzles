@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
@@ -41,7 +42,7 @@ class Puzzle:
     def pluses(self) -> List[Tuple[Cell, Cell, Cell, Cell, Cell]]:
         cell_set = set(self.cells)
         pluses: List[Tuple[Cell, Cell, Cell, Cell, Cell]] = []
-        for (x, y) in cell_set:
+        for x, y in cell_set:
             center = (x, y)
             north = (x, y - 1)
             east = (x + 1, y)
@@ -156,9 +157,7 @@ class Solver:
         for color in allowed:
             assignment[next_cell] = color
             if self._pluses_consistent_for_cell(assignment, next_cell):
-                sub_count, first_solution = self._search_all(
-                    assignment, first_solution
-                )
+                sub_count, first_solution = self._search_all(assignment, first_solution)
                 count += sub_count
             assignment.pop(next_cell)
         return count, first_solution
@@ -288,6 +287,93 @@ class Solver:
         return False
 
 
+class Generator:
+    def __init__(
+        self,
+        size: int,
+        givens: Dict[Cell, Color],
+        colors: Iterable[Color],
+        key_size: int,
+        disallowed_patterns: Optional[Iterable[Pattern]] = None,
+        candidate_patterns: Optional[Iterable[Pattern]] = None,
+        rng: Optional[random.Random] = None,
+    ):
+        self.size = size
+        self.givens = dict(givens)
+        self.colors = list(colors)
+        self.key_size = key_size
+        self.rng = rng or random.Random()
+        if candidate_patterns is None:
+            candidate_patterns = self._all_patterns(self.colors)
+        self.disallowed = self._canonical_set(disallowed_patterns or [])
+        self.candidates = self._unique_patterns(candidate_patterns)
+        if self.disallowed:
+            self.candidates = [
+                pattern
+                for pattern in self.candidates
+                if self._canonical_pattern(pattern) not in self.disallowed
+            ]
+
+    def find_unique_key(self, max_attempts: int = 1_000) -> Optional[List[Pattern]]:
+        if self.key_size > len(self.candidates):
+            return None
+        for _ in range(max_attempts):
+            key = self.rng.sample(self.candidates, self.key_size)
+            puzzle = Puzzle(size=self.size, key=key, givens=self.givens)
+            solver = Solver(puzzle)
+            solutions, complete = solver.solve_all_solutions(max_solutions=2)
+            if complete and len(solutions) == 1 and self._uses_all_colors(solutions[0]):
+                return key
+        return None
+
+    def _all_patterns(self, colors: Iterable[Color]) -> List[Pattern]:
+        colors_list = list(colors)
+        patterns: List[Pattern] = []
+        for c in colors_list:
+            for n in colors_list:
+                for e in colors_list:
+                    for s in colors_list:
+                        for w in colors_list:
+                            patterns.append((c, n, e, s, w))
+        return patterns
+
+    def _unique_patterns(self, patterns: Iterable[Pattern]) -> List[Pattern]:
+        seen: Dict[Pattern, Pattern] = {}
+        for pattern in patterns:
+            canonical = self._canonical_pattern(pattern)
+            if canonical not in seen:
+                seen[canonical] = pattern
+        return sorted(seen.values())
+
+    def _canonical_pattern(self, pattern: Pattern) -> Pattern:
+        variants = self._pattern_variants(pattern)
+        return min(variants)
+
+    def _canonical_set(self, patterns: Iterable[Pattern]) -> Set[Pattern]:
+        return {self._canonical_pattern(pattern) for pattern in patterns}
+
+    def _uses_all_colors(self, solution: Dict[Cell, Color]) -> bool:
+        present = set(solution.values())
+        return all(color in present for color in self.colors)
+
+    def _pattern_variants(self, pattern: Pattern) -> Set[Pattern]:
+        variants: Set[Pattern] = set()
+        rotated = pattern
+        for _ in range(4):
+            variants.add(rotated)
+            variants.add(self._flip_horizontal(rotated))
+            rotated = self._rotate(rotated)
+        return variants
+
+    def _rotate(self, pattern: Pattern) -> Pattern:
+        c, n, e, s, w = pattern
+        return (c, w, n, e, s)
+
+    def _flip_horizontal(self, pattern: Pattern) -> Pattern:
+        c, n, e, s, w = pattern
+        return (c, n, w, s, e)
+
+
 def _draw_solution_on_axes(
     ax,
     size: int,
@@ -309,6 +395,115 @@ def _draw_solution_on_axes(
     ax.set_xlim(-r - 1, r + 2)
     ax.set_ylim(-r - 1, r + 2)
     ax.axis("off")
+
+
+def _draw_pattern_tile(
+    ax,
+    pattern: Pattern,
+    origin_x: float,
+    origin_y: float,
+    color_map: Dict[Color, str],
+) -> None:
+    from matplotlib.patches import Rectangle
+
+    positions = {
+        POS_CENTER: (1, 1),
+        POS_NORTH: (1, 0),
+        POS_EAST: (2, 1),
+        POS_SOUTH: (1, 2),
+        POS_WEST: (0, 1),
+    }
+    for pos, (dx, dy) in positions.items():
+        color = color_map.get(pattern[pos], "white")
+        rect = Rectangle(
+            (origin_x + dx, origin_y + dy),
+            1,
+            1,
+            facecolor=color,
+            edgecolor="black",
+        )
+        ax.add_patch(rect)
+
+
+def _draw_key_patterns_on_axes(
+    ax,
+    key: List[Pattern],
+    color_map: Dict[Color, str],
+    columns: int = 4,
+) -> None:
+    from itertools import groupby
+
+    sorted_key = sorted(key, key=lambda pattern: pattern[POS_CENTER])
+    grouped = [
+        (center, list(patterns))
+        for center, patterns in groupby(sorted_key, key=lambda p: p[POS_CENTER])
+    ]
+
+    tile = 3
+    pad = 1
+    label_height = 1.2
+    columns = max(1, columns)
+
+    total_height = 0.0
+    max_width = 0.0
+    layout = []
+    for center, patterns in grouped:
+        rows = math.ceil(len(patterns) / columns) if patterns else 0
+        group_height = label_height + rows * (tile + pad)
+        total_height += group_height + pad
+        max_width = max(max_width, columns * (tile + pad) - pad)
+        layout.append((center, patterns, rows))
+
+    current_y = 0.0
+    for center, patterns, rows in layout:
+        ax.text(
+            0,
+            current_y + label_height * 0.7,
+            f"Center {center}",
+            ha="left",
+            va="center",
+            fontsize=10,
+        )
+        current_y += label_height
+        for idx, pattern in enumerate(patterns):
+            col = idx % columns
+            row = idx // columns
+            x = col * (tile + pad)
+            y = current_y + row * (tile + pad)
+            _draw_pattern_tile(ax, pattern, x, y, color_map)
+        current_y += rows * (tile + pad) + pad
+
+    ax.set_aspect("equal")
+    ax.set_xlim(-0.5, max_width + 0.5)
+    ax.set_ylim(total_height, -0.5)
+    ax.axis("off")
+
+
+def display_puzzle(
+    puzzle: Puzzle,
+    color_map: Optional[Dict[Color, str]] = None,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        print("Matplotlib is required for graphical display.")
+        return
+
+    if color_map is None:
+        color_map = {}
+
+    fig = plt.figure(figsize=(9, 6))
+    gs = fig.add_gridspec(1, 2, width_ratios=[2.2, 1])
+    ax_puzzle = fig.add_subplot(gs[0, 0])
+    ax_key = fig.add_subplot(gs[0, 1])
+
+    _draw_solution_on_axes(ax_puzzle, puzzle.size, puzzle.givens, color_map)
+    ax_puzzle.set_title("Puzzle")
+    _draw_key_patterns_on_axes(ax_key, puzzle.key, color_map)
+    ax_key.set_title("Key Patterns")
+
+    plt.tight_layout()
+    plt.show()
 
 
 def display_solution(
@@ -433,7 +628,7 @@ def display_solution_grid(
     plt.show()
 
 
-def main() -> None:
+def solve() -> None:
     # ## Original:
     # key = [
     #     ("O", "G", "G", "B", "G"),
@@ -482,9 +677,7 @@ def main() -> None:
         ("G", "R", "R", "R", "R"),
     ]
 
-    givens = {
-
-    }
+    givens = {}
 
     puzzle = Puzzle(size=2, key=key, givens=givens)
 
@@ -512,6 +705,7 @@ def main() -> None:
         "B": "#6aaed6",
         "R": "#d0635e",
     }
+    display_puzzle(puzzle, color_map=color_map)
     if count == 1:
         display_solution(puzzle.size, solutions[0], color_map=color_map)
     elif view_mode == "grid":
@@ -522,5 +716,47 @@ def main() -> None:
         display_solutions(puzzle.size, solutions, color_map=color_map)
 
 
+def generate() -> None:
+    ## Generator example:
+    color_map = {
+        "G": "#5aa469",
+        "O": "#e4a84e",
+        "B": "#6aaed6",
+        "R": "#d0635e",
+    }
+    size = 4
+    key_size = 10
+    givens = {
+        (0, 0): "R",
+        (-1, -1): "G",
+        (-1, 1): "G",
+        (1, -1): "G",
+        (1, 1): "G",
+    }
+    # disallowed = [
+    #     ("R", "R", "R", "R", "R"),
+    # ]
+    gen = Generator(
+        size=size,
+        givens=givens,
+        # disallowed_patterns=disallowed,
+        colors=color_map.keys(),
+        key_size=key_size,
+    )
+    max_attempts = 50_000
+    key = gen.find_unique_key(max_attempts=max_attempts)
+    if key is None:
+        print(f"No unique key found after {max_attempts} attempts.")
+        return
+    print(key)
+    puzzle = Puzzle(size=size, key=key, givens=givens)
+    display_puzzle(puzzle, color_map=color_map)
+    solver = Solver(puzzle)
+    solutions, complete = solver.solve_all_solutions(max_solutions=2)
+    assert complete and len(solutions) == 1
+    display_solution(puzzle.size, solutions[0], color_map=color_map)
+
+
 if __name__ == "__main__":
-    main()
+    # solve()
+    generate()
